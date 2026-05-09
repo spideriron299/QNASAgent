@@ -4,15 +4,26 @@ Basado en prueba1.ipynb + earthaccess_server.py + hdf_pipeline.py
                          + hdf_pipeline_server.py + pipeline_agent.py
 
 Uso:
-    streamlit run app.py
+    streamlit run Main.py
 
-Coloca estos archivos en el mismo directorio:
-    app.py
-    earthaccess_server.py
-    hdf_pipeline_server.py
-    hdf_pipeline.py
-    pipeline_agent.py
-    .env  (con EARTHDATA_USERNAME / EARTHDATA_PASSWORD / DB_URL / OPENAI_BASE_URL)
+Secrets (Streamlit Cloud → Settings → Secrets  O  .streamlit/secrets.toml local):
+─────────────────────────────────────────────────────────────────────────────────
+[earthdata]
+username = "TU_USUARIO_EARTHDATA"
+password = "TU_PASSWORD_EARTHDATA"
+
+[postgres]
+url = "postgresql://usuario:password@host:5432/base_de_datos"
+
+[llm]
+base_url = "http://localhost:8000/v1"
+model    = "Qwen/Qwen2.5-1.5B-Instruct"
+
+[dirs]
+hdf    = "~/Downloads/earthdata"
+output = "~/aerosol_csv"
+plots  = "~/aerosol_plots"
+─────────────────────────────────────────────────────────────────────────────────
 """
 
 # ─── std-lib ─────────────────────────────────────────────────────────────────
@@ -25,13 +36,6 @@ import sys
 from pathlib import Path
 from typing import Annotated, TypedDict
 
-# ─── dotenv (opcional) ───────────────────────────────────────────────────────
-try:
-    from dotenv import load_dotenv
-    load_dotenv(override=True)
-except ImportError:
-    pass
-
 # ─── Streamlit ───────────────────────────────────────────────────────────────
 import streamlit as st
 
@@ -41,6 +45,35 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+# ─── Helper para leer secrets: secrets.toml → env vars → default ─────────────
+def _s(section: str, key: str, env_var: str = "", default: str = "") -> str:
+    """Prioridad: st.secrets → os.environ → default."""
+    try:
+        return st.secrets[section][key]
+    except Exception:
+        pass
+    if env_var:
+        val = os.environ.get(env_var, "")
+        if val:
+            return val
+    return default
+
+# Cargar todos los secrets al inicio para inyectarlos en os.environ
+# (los servidores MCP los leen desde el entorno al arrancar)
+_ED_USER  = _s("earthdata", "username", "EARTHDATA_USERNAME")
+_ED_PASS  = _s("earthdata", "password", "EARTHDATA_PASSWORD")
+_DB_URL   = _s("postgres",  "url",      "DB_URL")
+_LLM_URL  = _s("llm",       "base_url", "OPENAI_BASE_URL", "http://localhost:8000/v1")
+_LLM_MOD  = _s("llm",       "model",    "LLM_MODEL",       "Qwen/Qwen2.5-1.5B-Instruct")
+_HDF_DIR  = _s("dirs",      "hdf",      "HDF_DIR",  str(Path.home() / "Downloads" / "earthdata"))
+_OUT_DIR  = _s("dirs",      "output",   "OUTPUT_DIR", str(Path.home() / "aerosol_csv"))
+_PLT_DIR  = _s("dirs",      "plots",    "PLOTS_DIR",  str(Path.home() / "aerosol_plots"))
+
+# Propagar al entorno para que los subprocesos MCP los hereden
+if _ED_USER: os.environ["EARTHDATA_USERNAME"] = _ED_USER
+if _ED_PASS: os.environ["EARTHDATA_PASSWORD"] = _ED_PASS
+if _DB_URL:  os.environ["DB_URL"]             = _DB_URL
 
 # ─── CSS ─────────────────────────────────────────────────────────────────────
 st.markdown("""
@@ -98,39 +131,43 @@ st.markdown("""
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SIDEBAR
+# SIDEBAR  — muestra los valores cargados desde secrets (editables en runtime)
 # ═══════════════════════════════════════════════════════════════════════════════
 with st.sidebar:
     st.markdown("### ⚙️ Configuración")
 
-    with st.expander("🔑 Credenciales NASA EarthData", expanded=True):
+    with st.expander("🔑 Credenciales NASA EarthData", expanded=bool(not _ED_USER)):
         ed_user = st.text_input(
             "EARTHDATA_USERNAME",
-            value=os.getenv("EARTHDATA_USERNAME", ""),
+            value=_ED_USER,
             placeholder="usuario@email.com",
         )
         ed_pass = st.text_input(
             "EARTHDATA_PASSWORD",
-            value=os.getenv("EARTHDATA_PASSWORD", ""),
+            value=_ED_PASS,
             type="password",
         )
+        if _ED_USER:
+            st.caption("✅ Cargado desde secrets")
 
     with st.expander("📂 Directorios"):
-        hdf_dir    = st.text_input("HDF / Descargas",  value=os.getenv("HDF_DIR",    str(Path.home()/"Downloads"/"earthdata")))
-        output_dir = st.text_input("CSV output",       value=os.getenv("OUTPUT_DIR", str(Path.home()/"aerosol_csv")))
-        plots_dir  = st.text_input("Gráficas output",  value=os.getenv("PLOTS_DIR",  str(Path.home()/"aerosol_plots")))
+        hdf_dir    = st.text_input("HDF / Descargas",  value=_HDF_DIR)
+        output_dir = st.text_input("CSV output",       value=_OUT_DIR)
+        plots_dir  = st.text_input("Gráficas output",  value=_PLT_DIR)
 
-    with st.expander("🗄️ PostgreSQL"):
+    with st.expander("🗄️ PostgreSQL", expanded=bool(not _DB_URL)):
         db_url = st.text_input(
             "DB URL",
-            value=os.getenv("DB_URL", ""),
-            placeholder="postgresql://user:pass@host/db",
+            value=_DB_URL,
+            placeholder="postgresql://user:pass@host:5432/db",
             type="password",
         )
+        if _DB_URL:
+            st.caption("✅ Cargado desde secrets")
 
     with st.expander("🤖 Modelo LLM (LM Studio)"):
-        llm_base_url = st.text_input("Base URL",  value=os.getenv("OPENAI_BASE_URL", "http://localhost:8000/v1"))
-        llm_model    = st.text_input("Modelo",    value=os.getenv("LLM_MODEL",       "Qwen/Qwen2.5-1.5B-Instruct"))
+        llm_base_url = st.text_input("Base URL", value=_LLM_URL)
+        llm_model    = st.text_input("Modelo",   value=_LLM_MOD)
 
     variable = st.selectbox(
         "📡 Variable aerosol",
@@ -160,7 +197,7 @@ with st.sidebar:
         st.success("✅ Listo")
 
 
-# ─── Helper: run async from sync Streamlit ──────────────────────────────────
+# ─── Helper: correr async desde Streamlit sync ───────────────────────────────
 def _run(coro):
     try:
         loop = asyncio.get_event_loop()
@@ -173,9 +210,9 @@ def _run(coro):
         return asyncio.run(coro)
 
 
-# ─── EarthAgent builder (mirrors notebook exactly) ──────────────────────────
+# ─── EarthAgent (igual al notebook) ──────────────────────────────────────────
 def _build_earth_agent():
-    from langchain_core.messages import AnyMessage, SystemMessage, ToolMessage
+    from langchain_core.messages import SystemMessage, ToolMessage
     from langchain_openai import ChatOpenAI
     from langgraph.graph import END, START, StateGraph
     from mcp import ClientSession, StdioServerParameters
@@ -274,8 +311,8 @@ def _build_earth_agent():
 @st.cache_resource(show_spinner=False)
 def _check_deps():
     missing = []
-    for m in ["langgraph","langchain_openai","mcp","langchain_mcp_adapters",
-              "earthaccess","pyhdf","psycopg2","matplotlib","pandas"]:
+    for m in ["langgraph", "langchain_openai", "mcp", "langchain_mcp_adapters",
+              "earthaccess", "pyhdf", "psycopg2", "matplotlib", "pandas"]:
         try:
             __import__(m)
         except ImportError:
@@ -316,15 +353,16 @@ with tabs[0]:
     with col2:
         s_short = st.text_input("Short name (alternativa)", "MYD04_3K", key="s_short")
     with col3:
-        s_max = st.number_input("Máx. granules", 1, 50, 5, key="s_max")
+        # ✅ FIX: usar keywords explícitos en number_input
+        s_max = st.number_input("Máx. granules", min_value=1, max_value=50, value=5, key="s_max")
 
     st.markdown("**Bounding box** — (oeste, sur, este, norte)")
     b1, b2, b3, b4 = st.columns(4)
-
-    s_w = b1.number_input("Oeste", value=-10.0, min_value=-180.0, max_value=180.0)
-    s_s = b2.number_input("Sur",   value=20.0,  min_value=-90.0,  max_value=90.0)
-    s_e = b3.number_input("Este",  value=10.0,  min_value=-180.0, max_value=180.0)
-    s_n = b4.number_input("Norte", value=50.0,  min_value=-90.0,  max_value=90.0)
+    # ✅ FIX: value= siempre como keyword, nunca como segundo argumento posicional
+    s_w = b1.number_input("Oeste", value=-10.0, min_value=-180.0, max_value=180.0, key="s_w")
+    s_s = b2.number_input("Sur",   value= 20.0, min_value= -90.0, max_value= 90.0, key="s_s")
+    s_e = b3.number_input("Este",  value= 10.0, min_value=-180.0, max_value=180.0, key="s_e")
+    s_n = b4.number_input("Norte", value= 50.0, min_value= -90.0, max_value= 90.0, key="s_n")
 
     d1, d2 = st.columns(2)
     s_date1 = d1.date_input("Fecha inicio", value=None, key="s_d1")
@@ -363,14 +401,16 @@ with tabs[1]:
     with col2:
         d_short   = st.text_input("Short name", "MYD04_3K", key="d_short")
     with col3:
-        d_max     = st.number_input("Máx. granules", 1, 20, 2, key="d_max")
+        # ✅ FIX
+        d_max = st.number_input("Máx. granules", min_value=1, max_value=20, value=2, key="d_max")
 
     st.markdown("**Bounding box**")
     b1, b2, b3, b4 = st.columns(4)
-    d_w = b1.number_input("Oeste", -10.0, min_value=-180.0, max_value=180.0, key="d_w")
-    d_s = b2.number_input("Sur",    20.0, min_value=-90.0,  max_value=90.0,  key="d_s")
-    d_e = b3.number_input("Este",   10.0, min_value=-180.0, max_value=180.0, key="d_e")
-    d_n = b4.number_input("Norte",  50.0, min_value=-90.0,  max_value=90.0,  key="d_n")
+    # ✅ FIX
+    d_w = b1.number_input("Oeste", value=-10.0, min_value=-180.0, max_value=180.0, key="d_w")
+    d_s = b2.number_input("Sur",   value= 20.0, min_value= -90.0, max_value= 90.0, key="d_s")
+    d_e = b3.number_input("Este",  value= 10.0, min_value=-180.0, max_value=180.0, key="d_e")
+    d_n = b4.number_input("Norte", value= 50.0, min_value= -90.0, max_value= 90.0, key="d_n")
 
     d1c, d2c = st.columns(2)
     d_date1 = d1c.date_input("Fecha inicio", value=None, key="d_d1")
@@ -393,7 +433,7 @@ with tabs[1]:
                 reply  = result["messages"][-1].content
                 st.markdown(f'<div class="result-box">{reply}</div>', unsafe_allow_html=True)
 
-                dl_path = Path(dl_dir).expanduser()
+                dl_path   = Path(dl_dir).expanduser()
                 hdf_files = list(dl_path.glob("*.hdf")) + list(dl_path.glob("*.HDF"))
                 if hdf_files:
                     st.success(f"✅ {len(hdf_files)} archivos HDF en `{dl_path}`")
@@ -443,11 +483,11 @@ with tabs[3]:
 
     pc1, pc2 = st.columns(2)
     with pc1:
-        p_hdf   = st.text_input("📁 Dir. HDF",    value=hdf_dir,    key="p_hdf")
-        p_out   = st.text_input("📂 Dir. CSV",    value=output_dir, key="p_out")
+        p_hdf   = st.text_input("📁 Dir. HDF",   value=hdf_dir,    key="p_hdf")
+        p_out   = st.text_input("📂 Dir. CSV",   value=output_dir, key="p_out")
     with pc2:
-        p_plots = st.text_input("🖼️ Dir. plots",  value=plots_dir,  key="p_plots")
-        p_db    = st.text_input("🗄️ DB URL",      value=db_url,     type="password", key="p_db")
+        p_plots = st.text_input("🖼️ Dir. plots", value=plots_dir,  key="p_plots")
+        p_db    = st.text_input("🗄️ DB URL",     value=db_url,     type="password", key="p_db")
 
     p_var = st.selectbox("Variable aerosol", [
         "Optical_Depth_Land_And_Ocean",
@@ -462,7 +502,6 @@ with tabs[3]:
         "Fitting_Error_Land",
     ], key="p_var")
 
-    # Flags skip — igual que run_pipeline()
     sk1, sk2, sk3 = st.columns(3)
     skip_convert = sk1.checkbox("⏭️ Saltar HDF→CSV")
     skip_load    = sk2.checkbox("⏭️ Saltar carga BD")
@@ -478,7 +517,6 @@ with tabs[3]:
         for d in [p_hdf, p_out, p_plots]:
             Path(d).expanduser().mkdir(parents=True, exist_ok=True)
 
-        # Logger que escribe en tiempo real en el widget
         log_placeholder = st.empty()
         log_lines: list[str] = []
 
@@ -588,11 +626,11 @@ with tabs[4]:
             "Image_Optical_Depth_Land_And_Ocean",
             "Corrected_Optical_Depth_Land_wav2p1",
         ], key="g_var")
-        g_vmin = st.number_input("Vmin",  value=0.0,  key="g_vmin")
-        g_vmax = st.number_input("Vmax",  value=1.5,  key="g_vmax")
+        g_vmin = st.number_input("Vmin", value=0.0, key="g_vmin")
+        g_vmax = st.number_input("Vmax", value=1.5, key="g_vmax")
     with g2:
-        g_res  = st.number_input("Resolución heatmap (°)", value=0.5, key="g_res")
-        g_db   = st.text_input("DB URL", value=db_url, type="password", key="g_db")
+        g_res = st.number_input("Resolución heatmap (°)", value=0.5, key="g_res")
+        g_db  = st.text_input("DB URL", value=db_url, type="password", key="g_db")
 
     g_types = st.multiselect(
         "Tipos de gráfica",
@@ -608,13 +646,13 @@ with tabs[4]:
                 loader  = PostgresLoader(db_url=g_db)
                 plotter = AerosolPlotter(loader=loader, plots_dir=plots_dir)
                 generated = []
-                if "scatter_map"  in g_types:
+                if "scatter_map" in g_types:
                     p = plotter.scatter_map(variable=g_var, vmin=g_vmin, vmax=g_vmax)
                     if p: generated.append(p)
-                if "heatmap"      in g_types:
+                if "heatmap" in g_types:
                     p = plotter.heatmap(variable=g_var, resolution=g_res, vmin=g_vmin, vmax=g_vmax)
                     if p: generated.append(p)
-                if "time_series"  in g_types:
+                if "time_series" in g_types:
                     p = plotter.time_series(variable=g_var)
                     if p: generated.append(p)
 
