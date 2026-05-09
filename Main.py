@@ -320,10 +320,11 @@ with tabs[0]:
 
     st.markdown("**Bounding box** — (oeste, sur, este, norte)")
     b1, b2, b3, b4 = st.columns(4)
-    s_w = b1.number_input("Oeste", -10.0, min_value=-180.0, max_value=180.0, key="s_w")
-    s_s = b2.number_input("Sur",    20.0, min_value=-90.0,  max_value=90.0,  key="s_s")
-    s_e = b3.number_input("Este",   10.0, min_value=-180.0, max_value=180.0, key="s_e")
-    s_n = b4.number_input("Norte",  50.0, min_value=-90.0,  max_value=90.0,  key="s_n")
+
+    s_w = b1.number_input("Oeste", value=-10.0, min_value=-180.0, max_value=180.0)
+    s_s = b2.number_input("Sur",   value=20.0,  min_value=-90.0,  max_value=90.0)
+    s_e = b3.number_input("Este",  value=10.0,  min_value=-180.0, max_value=180.0)
+    s_n = b4.number_input("Norte", value=50.0,  min_value=-90.0,  max_value=90.0)
 
     d1, d2 = st.columns(2)
     s_date1 = d1.date_input("Fecha inicio", value=None, key="s_d1")
