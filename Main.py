@@ -1,411 +1,701 @@
-import streamlit as st
-import h5py
-import pandas as pd
-import pydeck as pdk
-import numpy as np
-import tempfile
+"""
+NASA EarthData Explorer — Streamlit App
+Basado en prueba1.ipynb + earthaccess_server.py + hdf_pipeline.py
+                         + hdf_pipeline_server.py + pipeline_agent.py
+
+Uso:
+    streamlit run app.py
+
+Coloca estos archivos en el mismo directorio:
+    app.py
+    earthaccess_server.py
+    hdf_pipeline_server.py
+    hdf_pipeline.py
+    pipeline_agent.py
+    .env  (con EARTHDATA_USERNAME / EARTHDATA_PASSWORD / DB_URL / OPENAI_BASE_URL)
+"""
+
+# ─── std-lib ─────────────────────────────────────────────────────────────────
+import asyncio
+import logging
+import operator
 import os
-import psycopg2
-from psycopg2.extras import execute_values
+import re
+import sys
+from pathlib import Path
+from typing import Annotated, TypedDict
 
+# ─── dotenv (opcional) ───────────────────────────────────────────────────────
 try:
-    import netCDF4 as nc
-    NETCDF4_AVAILABLE = True
+    from dotenv import load_dotenv
+    load_dotenv(override=True)
 except ImportError:
-    NETCDF4_AVAILABLE = False
+    pass
 
-try:
-    from osgeo import gdal, osr
-    gdal.UseExceptions()
-    GDAL_AVAILABLE = True
-except ImportError:
-    GDAL_AVAILABLE = False
+# ─── Streamlit ───────────────────────────────────────────────────────────────
+import streamlit as st
 
-st.set_page_config(page_title="HDF Geo-Explorer", layout="wide")
-st.title("🛰️ Visor de Archivos HDF con Mapa")
-
-
-# ──────────────────────────────────────────────
-# Base de datos
-# ──────────────────────────────────────────────
-@st.cache_resource
-def get_connection():
-    url = st.secrets["database"]["url"]
-    conn = psycopg2.connect(url)
-    conn.autocommit = True
-    return conn
-
-
-def init_db():
-    conn = get_connection()
-    with conn.cursor() as cur:
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS archivos_hdf (
-                id SERIAL PRIMARY KEY,
-                nombre TEXT NOT NULL,
-                dataset TEXT,
-                formato TEXT,
-                fecha_carga TIMESTAMP DEFAULT NOW(),
-                num_puntos INTEGER
-            );
-        """)
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS puntos_geo (
-                id SERIAL PRIMARY KEY,
-                archivo_id INTEGER REFERENCES archivos_hdf(id) ON DELETE CASCADE,
-                lat DOUBLE PRECISION,
-                lon DOUBLE PRECISION,
-                value DOUBLE PRECISION
-            );
-        """)
-        cur.execute("""
-            CREATE INDEX IF NOT EXISTS idx_puntos_archivo ON puntos_geo(archivo_id);
-        """)
-
-
-def save_to_db(nombre, dataset, formato, geo_df):
-    conn = get_connection()
-    with conn.cursor() as cur:
-        cur.execute("""
-            INSERT INTO archivos_hdf (nombre, dataset, formato, num_puntos)
-            VALUES (%s, %s, %s, %s) RETURNING id
-        """, (nombre, dataset, formato, len(geo_df)))
-        archivo_id = cur.fetchone()[0]
-        rows = [
-            (archivo_id, float(row.lat), float(row.lon), float(row.value) if hasattr(row, 'value') else None)
-            for row in geo_df.itertuples()
-        ]
-        execute_values(cur,
-            "INSERT INTO puntos_geo (archivo_id, lat, lon, value) VALUES %s", rows)
-    return archivo_id
-
-
-def load_archivos():
-    conn = get_connection()
-    return pd.read_sql(
-        "SELECT id, nombre, dataset, formato, fecha_carga, num_puntos "
-        "FROM archivos_hdf ORDER BY fecha_carga DESC", conn)
-
-
-def load_puntos(archivo_id):
-    conn = get_connection()
-    return pd.read_sql(
-        "SELECT lat, lon, value FROM puntos_geo WHERE archivo_id = %s",
-        conn, params=(archivo_id,))
-
-
-def delete_archivo(archivo_id):
-    conn = get_connection()
-    with conn.cursor() as cur:
-        cur.execute("DELETE FROM archivos_hdf WHERE id = %s", (archivo_id,))
-
-
-# ──────────────────────────────────────────────
-# Lectores HDF
-# ──────────────────────────────────────────────
-def collect_datasets_hdf5(hdf_file):
-    found = []
-    def _visitor(name, obj):
-        if isinstance(obj, h5py.Dataset):
-            found.append(name)
-    hdf_file.visititems(_visitor)
-    return found
-
-
-def read_hdf5(tmp_path, key):
-    with h5py.File(tmp_path, 'r') as f:
-        datasets = collect_datasets_hdf5(f)
-        if not datasets:
-            return None, None, None
-        target = st.sidebar.selectbox("Dataset", datasets, key=key)
-        node = f[target]
-        if node.ndim < 2:
-            st.warning("El dataset debe ser al menos bidimensional.")
-            return None, None, None
-        raw = node[:10_000]
-        df = pd.DataFrame(raw)
-    return df, None, target
-
-
-def read_netcdf(tmp_path, key):
-    if not NETCDF4_AVAILABLE:
-        return None, None, None
-    try:
-        ds = nc.Dataset(tmp_path, 'r')
-    except Exception as e:
-        st.error(f"No se pudo abrir: {e}")
-        return None, None, None
-    var_names = [v for v in ds.variables if ds.variables[v].ndim >= 2]
-    if not var_names:
-        ds.close()
-        return None, None, None
-    target = st.sidebar.selectbox("Variable", var_names, key=key)
-    raw = np.array(ds.variables[target][:])
-    ds.close()
-    if raw.ndim > 2:
-        raw = raw[0]
-    return pd.DataFrame(raw[:10_000]), None, target
-
-
-def raster_to_geo_df(band_ds, max_points=50_000):
-    gt = band_ds.GetGeoTransform()
-    src_srs = band_ds.GetSpatialRef()
-    cols = band_ds.RasterXSize
-    rows = band_ds.RasterYSize
-
-    wgs84 = osr.SpatialReference()
-    wgs84.ImportFromEPSG(4326)
-    wgs84.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
-
-    need_reproject = src_srs is not None and not src_srs.IsSame(wgs84)
-    if need_reproject:
-        transform = osr.CoordinateTransformation(src_srs, wgs84)
-
-    total = rows * cols
-    step = int(np.ceil(np.sqrt(total / max_points))) if total > max_points else 1
-
-    band = band_ds.GetRasterBand(1)
-    nodata = band.GetNoDataValue()
-    data = band.ReadAsArray()
-
-    records = []
-    for r in range(0, rows, step):
-        for c in range(0, cols, step):
-            val = float(data[r, c])
-            if nodata is not None and val == nodata:
-                continue
-            x = gt[0] + (c + 0.5) * gt[1] + (r + 0.5) * gt[2]
-            y = gt[3] + (c + 0.5) * gt[4] + (r + 0.5) * gt[5]
-            if need_reproject:
-                try:
-                    lon, lat, _ = transform.TransformPoint(x, y)
-                except Exception:
-                    continue
-            else:
-                lon, lat = x, y
-            if -90 <= lat <= 90 and -180 <= lon <= 180:
-                records.append({'lat': lat, 'lon': lon, 'value': val})
-    return pd.DataFrame(records)
-
-
-def read_hdf4(tmp_path, key):
-    if not GDAL_AVAILABLE:
-        st.error("GDAL no está disponible.")
-        return None, None, None
-    ds = gdal.Open(tmp_path)
-    if ds is None:
-        st.error("GDAL no pudo abrir el archivo.")
-        return None, None, None
-    subdatasets = ds.GetSubDatasets()
-    ds = None
-    if not subdatasets:
-        return None, None, None
-
-    options = [s[1] for s in subdatasets]
-    paths   = [s[0] for s in subdatasets]
-    target_label = st.sidebar.selectbox("Dataset", options, key=key)
-    target_path  = paths[options.index(target_label)]
-
-    band_ds = gdal.Open(target_path)
-    if band_ds is None:
-        return None, None, None
-
-    raw = band_ds.GetRasterBand(1).ReadAsArray()
-    df_preview = pd.DataFrame(raw[:100])
-    with st.spinner("Calculando coordenadas lat/lon..."):
-        geo_df = raster_to_geo_df(band_ds)
-    band_ds = None
-    return df_preview, geo_df, target_label
-
-
-def process_upload(uploaded_file, key_suffix):
-    """Lee el archivo subido y devuelve (df, geo_df, dataset, formato)."""
-    ext = uploaded_file.name.rsplit('.', 1)[-1].lower()
-    with tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}") as tmp:
-        tmp.write(uploaded_file.getvalue())
-        tmp_path = tmp.name
-    try:
-        if ext in ('h5', 'hdf5'):
-            df, geo_df, dataset = read_hdf5(tmp_path, key_suffix)
-            formato = "HDF5"
-        elif ext in ('nc', 'nc4', 'he5'):
-            df, geo_df, dataset = read_netcdf(tmp_path, key_suffix)
-            formato = "NetCDF"
-        else:
-            df, geo_df, dataset = read_hdf4(tmp_path, key_suffix)
-            formato = "HDF4"
-    finally:
-        os.unlink(tmp_path)
-    return df, geo_df, dataset, formato
-
-
-# ──────────────────────────────────────────────
-# Mapa
-# ──────────────────────────────────────────────
-def render_map(map_df):
-    if map_df is None or map_df.empty:
-        st.warning("No hay puntos para mostrar.")
-        return
-
-    map_df = map_df.copy()
-    if 'value' in map_df.columns and map_df['value'].notna().any():
-        vmin = map_df['value'].quantile(0.02)
-        vmax = map_df['value'].quantile(0.98)
-        norm = ((map_df['value'] - vmin) / (vmax - vmin + 1e-9)).clip(0, 1)
-        map_df['r'] = (norm * 200).astype(int)
-        map_df['g'] = 30
-        map_df['b'] = ((1 - norm) * 200).astype(int)
-        color = "[r, g, b, 180]"
-    else:
-        color = "[200, 30, 0, 160]"
-
-    st.pydeck_chart(pdk.Deck(
-        map_style="mapbox://styles/mapbox/light-v9",
-        initial_view_state=pdk.ViewState(
-            latitude=map_df['lat'].mean(),
-            longitude=map_df['lon'].mean(),
-            zoom=4, pitch=0,
-        ),
-        layers=[pdk.Layer(
-            "ScatterplotLayer",
-            data=map_df,
-            get_position="[lon, lat]",
-            get_color=color,
-            get_radius=5_000,
-            pickable=True,
-        )],
-        tooltip={"text": "Lat: {lat}\nLon: {lon}\nValor: {value}"},
-    ))
-    st.caption(f"{len(map_df):,} puntos graficados.")
-
-
-# ──────────────────────────────────────────────
-# Main
-# ──────────────────────────────────────────────
-init_db()
-
-# Uploader en sidebar — persiste entre tabs
-uploaded_file = st.sidebar.file_uploader(
-    "Sube tu archivo HDF4, HDF5 o NetCDF",
-    type=['h5', 'hdf5', 'hdf', 'he4', 'he5', 'nc', 'nc4']
+st.set_page_config(
+    page_title="NASA EarthData Explorer",
+    page_icon="🛰️",
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-tab_datos, tab_historial, tab_subir = st.tabs([
-    "📊 Datos cargados",
-    "🗄️ Historial",
-    "💾 Subir a BD",
+# ─── CSS ─────────────────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@300;400;600&display=swap');
+
+html, body, [class*="css"] { font-family: 'IBM Plex Sans', sans-serif; }
+h1,h2,h3 { font-family: 'IBM Plex Mono', monospace; }
+
+.hero {
+    background: linear-gradient(135deg,#050d1a 0%,#0a1e35 60%,#061525 100%);
+    border:1px solid #1a3555; border-radius:14px;
+    padding:28px 36px; margin-bottom:22px; position:relative; overflow:hidden;
+}
+.hero::after {
+    content:''; position:absolute; top:-60px; right:-60px;
+    width:260px; height:260px;
+    background:radial-gradient(circle,rgba(0,160,255,.10) 0%,transparent 70%);
+    border-radius:50%;
+}
+.hero h1 { color:#dff0ff; font-size:1.75rem; margin:0; letter-spacing:-0.5px; }
+.hero p  { color:#6aa6cc; margin:6px 0 0; font-size:.92rem; }
+
+.step-title {
+    font-family:'IBM Plex Mono',monospace; font-size:.85rem;
+    color:#60b0ff; text-transform:uppercase; letter-spacing:1px;
+    margin-bottom:8px;
+}
+.result-box {
+    background:#060e1c; border:1px solid #1a3555; border-radius:9px;
+    padding:16px 20px; font-family:'IBM Plex Mono',monospace; font-size:.82rem;
+    color:#b8d8f0; line-height:1.75; white-space:pre-wrap; overflow-x:auto;
+}
+.metric-row { display:flex; gap:16px; flex-wrap:wrap; margin:12px 0; }
+.metric-pill {
+    background:#0d1f38; border:1px solid #1e4070;
+    border-radius:8px; padding:10px 18px; text-align:center; flex:1; min-width:120px;
+}
+.metric-pill .val { font-family:'IBM Plex Mono',monospace; font-size:1.5rem; color:#4cc9f0; }
+.metric-pill .lbl { font-size:.75rem; color:#5a8aaa; margin-top:3px; }
+
+section[data-testid="stSidebar"] {
+    background:#07101d; border-right:1px solid #142236;
+}
+</style>
+""", unsafe_allow_html=True)
+
+# ─── Hero ─────────────────────────────────────────────────────────────────────
+st.markdown("""
+<div class="hero">
+    <h1>🛰️ NASA EarthData Explorer</h1>
+    <p>Busca · Descarga · Procesa · Visualiza — datos MODIS aerosoles con agentes IA</p>
+</div>
+""", unsafe_allow_html=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SIDEBAR
+# ═══════════════════════════════════════════════════════════════════════════════
+with st.sidebar:
+    st.markdown("### ⚙️ Configuración")
+
+    with st.expander("🔑 Credenciales NASA EarthData", expanded=True):
+        ed_user = st.text_input(
+            "EARTHDATA_USERNAME",
+            value=os.getenv("EARTHDATA_USERNAME", ""),
+            placeholder="usuario@email.com",
+        )
+        ed_pass = st.text_input(
+            "EARTHDATA_PASSWORD",
+            value=os.getenv("EARTHDATA_PASSWORD", ""),
+            type="password",
+        )
+
+    with st.expander("📂 Directorios"):
+        hdf_dir    = st.text_input("HDF / Descargas",  value=os.getenv("HDF_DIR",    str(Path.home()/"Downloads"/"earthdata")))
+        output_dir = st.text_input("CSV output",       value=os.getenv("OUTPUT_DIR", str(Path.home()/"aerosol_csv")))
+        plots_dir  = st.text_input("Gráficas output",  value=os.getenv("PLOTS_DIR",  str(Path.home()/"aerosol_plots")))
+
+    with st.expander("🗄️ PostgreSQL"):
+        db_url = st.text_input(
+            "DB URL",
+            value=os.getenv("DB_URL", ""),
+            placeholder="postgresql://user:pass@host/db",
+            type="password",
+        )
+
+    with st.expander("🤖 Modelo LLM (LM Studio)"):
+        llm_base_url = st.text_input("Base URL",  value=os.getenv("OPENAI_BASE_URL", "http://localhost:8000/v1"))
+        llm_model    = st.text_input("Modelo",    value=os.getenv("LLM_MODEL",       "Qwen/Qwen2.5-1.5B-Instruct"))
+
+    variable = st.selectbox(
+        "📡 Variable aerosol",
+        [
+            "Optical_Depth_Land_And_Ocean",
+            "Image_Optical_Depth_Land_And_Ocean",
+            "Corrected_Optical_Depth_Land_wav2p1",
+            "Optical_Depth_Ratio_Small_Land",
+            "Angstrom_Exponent_1_Ocean",
+            "Angstrom_Exponent_2_Ocean",
+            "Mass_Concentration_Land",
+            "Aerosol_Cloud_Fraction_Land",
+            "Aerosol_Cloud_Fraction_Ocean",
+            "Fitting_Error_Land",
+        ],
+    )
+
+    if st.button("💾 Aplicar configuración", use_container_width=True):
+        os.environ["EARTHDATA_USERNAME"] = ed_user
+        os.environ["EARTHDATA_PASSWORD"] = ed_pass
+        if db_url:
+            os.environ["DB_URL"] = db_url
+        os.environ["OPENAI_BASE_URL"] = llm_base_url
+        os.environ["LLM_MODEL"]       = llm_model
+        for d in [hdf_dir, output_dir, plots_dir]:
+            Path(d).expanduser().mkdir(parents=True, exist_ok=True)
+        st.success("✅ Listo")
+
+
+# ─── Helper: run async from sync Streamlit ──────────────────────────────────
+def _run(coro):
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                return pool.submit(asyncio.run, coro).result()
+        return loop.run_until_complete(coro)
+    except RuntimeError:
+        return asyncio.run(coro)
+
+
+# ─── EarthAgent builder (mirrors notebook exactly) ──────────────────────────
+def _build_earth_agent():
+    from langchain_core.messages import AnyMessage, SystemMessage, ToolMessage
+    from langchain_openai import ChatOpenAI
+    from langgraph.graph import END, START, StateGraph
+    from mcp import ClientSession, StdioServerParameters
+    from mcp.client.stdio import stdio_client
+    from langchain_mcp_adapters.tools import load_mcp_tools
+
+    EARTHACCESS_SERVER = StdioServerParameters(
+        command=sys.executable,
+        args=["earthaccess_server.py"],
+        env={**os.environ},
+    )
+
+    model = ChatOpenAI(
+        model=llm_model,
+        base_url=llm_base_url,
+        api_key="not-required",
+    )
+
+    class AgentState(TypedDict):
+        messages: Annotated[list, operator.add]
+
+    async def router(state):
+        prompt = (
+            "You are a NASA EarthData assistant router. "
+            "Analyze the user query and return exactly one word: "
+            "'search', 'download', or 'discover'. No explanation."
+        )
+        msg = await model.ainvoke([SystemMessage(content=prompt)] + state["messages"])
+        return {"messages": [msg]}
+
+    def router_decision(state):
+        raw = state["messages"][-1].content.lower()
+        raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
+        for opt in ("download", "discover", "search"):
+            if opt in raw:
+                return opt
+        return "search"
+
+    async def _agent(state, prompt_text):
+        user_query = state["messages"][-2]
+        async with stdio_client(EARTHACCESS_SERVER) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                tools = await load_mcp_tools(session)
+                mwt   = model.bind_tools(tools)
+                msgs  = [SystemMessage(content=prompt_text), user_query]
+                resp  = await mwt.ainvoke(msgs)
+                msgs.append(resp)
+                if resp.tool_calls:
+                    for tc in resp.tool_calls:
+                        result = await session.call_tool(tc["name"], arguments=tc["args"])
+                        msgs.append(ToolMessage(content=result.content[-1].text, tool_call_id=tc["id"]))
+                    resp = await mwt.ainvoke(msgs)
+                    msgs.append(resp)
+                return {"messages": msgs[1:]}
+
+    async def search_agent(state):
+        return await _agent(state, (
+            "You are a NASA EarthData specialist. Use MCP tools to search granules. "
+            "Extract bbox and dates from user request. Present results clearly: "
+            "how many granules were found and a brief summary of metadata."
+        ))
+
+    async def download_agent(state):
+        return await _agent(state, (
+            "You are a NASA EarthData download specialist. Use download_granules tool. "
+            "Extract concept_id or short_name, bounding box, dates, and output dir. "
+            "After downloading, confirm how many files were saved and where."
+        ))
+
+    async def discover_agent(state):
+        return await _agent(state, (
+            "You are a NASA EarthData catalog specialist. Use discover_datasets tool. "
+            "Extract keywords and present results as a clear table: "
+            "concept_id, short_name, version, provider, title."
+        ))
+
+    g = StateGraph(AgentState)
+    g.add_node("router",         router)
+    g.add_node("search_agent",   search_agent)
+    g.add_node("download_agent", download_agent)
+    g.add_node("discover_agent", discover_agent)
+    g.add_edge(START, "router")
+    g.add_edge("search_agent",   END)
+    g.add_edge("download_agent", END)
+    g.add_edge("discover_agent", END)
+    g.add_conditional_edges("router", router_decision, {
+        "search":   "search_agent",
+        "download": "download_agent",
+        "discover": "discover_agent",
+    })
+    return g.compile()
+
+
+# ─── Dependency check ─────────────────────────────────────────────────────────
+@st.cache_resource(show_spinner=False)
+def _check_deps():
+    missing = []
+    for m in ["langgraph","langchain_openai","mcp","langchain_mcp_adapters",
+              "earthaccess","pyhdf","psycopg2","matplotlib","pandas"]:
+        try:
+            __import__(m)
+        except ImportError:
+            missing.append(m)
+    return missing
+
+missing_deps = _check_deps()
+if missing_deps:
+    st.warning(
+        f"⚠️ Dependencias faltantes: `{'`, `'.join(missing_deps)}`\n\n"
+        f"```\npip install {' '.join(missing_deps)}\n```"
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TABS
+# ═══════════════════════════════════════════════════════════════════════════════
+tabs = st.tabs([
+    "🔍 Buscar granules",
+    "⬇️ Descargar",
+    "🗂️ Descubrir datasets",
+    "⚙️ Pipeline HDF",
+    "📊 Gráficas",
+    "🗄️ Base de datos",
 ])
 
-# Procesar archivo una sola vez y guardar en session_state
-if uploaded_file is not None:
-    file_id = uploaded_file.name + str(uploaded_file.size)
-    if st.session_state.get("file_id") != file_id:
-        with st.spinner("Leyendo archivo..."):
-            df, geo_df, dataset, formato = process_upload(uploaded_file, "main")
-        st.session_state["file_id"]  = file_id
-        st.session_state["df"]       = df
-        st.session_state["geo_df"]   = geo_df
-        st.session_state["dataset"]  = dataset
-        st.session_state["formato"]  = formato
-        st.session_state["nombre"]   = uploaded_file.name
-        st.sidebar.success(f"{formato} cargado ✅")
-else:
-    # Limpiar si se quitó el archivo
-    for k in ["file_id","df","geo_df","dataset","formato","nombre"]:
-        st.session_state.pop(k, None)
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 0 — BUSCAR GRANULES
+# ══════════════════════════════════════════════════════════════════════════════
+with tabs[0]:
+    st.markdown('<div class="step-title">🔍 Buscar granules satelitales</div>', unsafe_allow_html=True)
+    st.caption("Llama a `search_by_concept_id` o `search_by_short_name` vía EarthAgent.")
 
-# ── TAB 1: Datos cargados ──
-with tab_datos:
-    if "df" not in st.session_state:
-        st.info("Sube un archivo desde la barra lateral para comenzar.")
-    else:
-        df     = st.session_state["df"]
-        geo_df = st.session_state["geo_df"]
+    col1, col2, col3 = st.columns([2, 2, 1])
+    with col1:
+        s_concept = st.text_input("Concept ID", "C1443528505-LAADS", key="s_concept",
+                                  help="Ej: C1443528505-LAADS para MYD04_3K v6.1")
+    with col2:
+        s_short = st.text_input("Short name (alternativa)", "MYD04_3K", key="s_short")
+    with col3:
+        s_max = st.number_input("Máx. granules", 1, 50, 5, key="s_max")
 
-        st.subheader(f"📄 Dataset: `{st.session_state['dataset']}`")
-        st.dataframe(df.head(100), use_container_width=True)
+    st.markdown("**Bounding box** — (oeste, sur, este, norte)")
+    b1, b2, b3, b4 = st.columns(4)
+    s_w = b1.number_input("Oeste", -10.0, min_value=-180.0, max_value=180.0, key="s_w")
+    s_s = b2.number_input("Sur",    20.0, min_value=-90.0,  max_value=90.0,  key="s_s")
+    s_e = b3.number_input("Este",   10.0, min_value=-180.0, max_value=180.0, key="s_e")
+    s_n = b4.number_input("Norte",  50.0, min_value=-90.0,  max_value=90.0,  key="s_n")
 
-        st.divider()
-        st.subheader("🗺️ Mapa")
+    d1, d2 = st.columns(2)
+    s_date1 = d1.date_input("Fecha inicio", value=None, key="s_d1")
+    s_date2 = d2.date_input("Fecha fin",    value=None, key="s_d2")
 
-        map_df = geo_df if (geo_df is not None and not geo_df.empty) else None
+    if st.button("🔍 Buscar", key="btn_search", use_container_width=True):
+        id_part   = f"(concept_id {s_concept})" if s_concept else f"(short_name {s_short})"
+        date_part = f" desde {s_date1} hasta {s_date2}," if s_date1 and s_date2 else ""
+        query = (
+            f"Busca datos de aerosoles MODIS {id_part} "
+            f"en la región ({s_w}, {s_s}, {s_e}, {s_n})"
+            f"{date_part} máximo {s_max} granules."
+        )
+        with st.spinner("🛰️ Consultando NASA EarthData..."):
+            try:
+                from langchain_core.messages import HumanMessage
+                agent  = _build_earth_agent()
+                result = _run(agent.ainvoke({"messages": [HumanMessage(content=query)]}))
+                reply  = result["messages"][-1].content
+                st.markdown(f'<div class="result-box">{reply}</div>', unsafe_allow_html=True)
+            except Exception as e:
+                st.error(f"**Error:** {e}")
+                st.info("Verifica que `earthaccess_server.py` esté en el mismo directorio y las credenciales sean correctas.")
 
-        # Para HDF5/NetCDF sin geo_df, el usuario elige columnas
-        if map_df is None:
-            numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-            if len(numeric_cols) >= 2:
-                c1, c2 = st.columns(2)
-                with c1:
-                    lat_col = st.selectbox("Columna Latitud", numeric_cols, index=0)
-                with c2:
-                    lon_options = [c for c in numeric_cols if c != lat_col]
-                    lon_col = st.selectbox("Columna Longitud", lon_options)
-                map_df = (
-                    df[[lat_col, lon_col]].dropna()
-                    .rename(columns={lat_col: 'lat', lon_col: 'lon'})
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 1 — DESCARGAR
+# ══════════════════════════════════════════════════════════════════════════════
+with tabs[1]:
+    st.markdown('<div class="step-title">⬇️ Descargar granules</div>', unsafe_allow_html=True)
+    st.caption("Llama a `download_granules` vía EarthAgent. Los archivos HDF se guardan en el directorio configurado.")
+
+    col1, col2, col3 = st.columns([2, 2, 1])
+    with col1:
+        d_concept = st.text_input("Concept ID", "C1443528505-LAADS", key="d_concept")
+    with col2:
+        d_short   = st.text_input("Short name", "MYD04_3K", key="d_short")
+    with col3:
+        d_max     = st.number_input("Máx. granules", 1, 20, 2, key="d_max")
+
+    st.markdown("**Bounding box**")
+    b1, b2, b3, b4 = st.columns(4)
+    d_w = b1.number_input("Oeste", -10.0, min_value=-180.0, max_value=180.0, key="d_w")
+    d_s = b2.number_input("Sur",    20.0, min_value=-90.0,  max_value=90.0,  key="d_s")
+    d_e = b3.number_input("Este",   10.0, min_value=-180.0, max_value=180.0, key="d_e")
+    d_n = b4.number_input("Norte",  50.0, min_value=-90.0,  max_value=90.0,  key="d_n")
+
+    d1c, d2c = st.columns(2)
+    d_date1 = d1c.date_input("Fecha inicio", value=None, key="d_d1")
+    d_date2 = d2c.date_input("Fecha fin",    value=None, key="d_d2")
+
+    dl_dir = st.text_input("📁 Directorio destino", value=hdf_dir, key="dl_dir")
+
+    if st.button("⬇️ Descargar", key="btn_dl", use_container_width=True):
+        date_part = f" del {d_date1} al {d_date2}" if d_date1 and d_date2 else ""
+        query = (
+            f"Descarga {d_max} granules de {d_short} ({d_concept}) "
+            f"bbox ({d_w}, {d_s}, {d_e}, {d_n}){date_part} "
+            f"en {dl_dir}"
+        )
+        with st.spinner("⬇️ Descargando datos satelitales..."):
+            try:
+                from langchain_core.messages import HumanMessage
+                agent  = _build_earth_agent()
+                result = _run(agent.ainvoke({"messages": [HumanMessage(content=query)]}))
+                reply  = result["messages"][-1].content
+                st.markdown(f'<div class="result-box">{reply}</div>', unsafe_allow_html=True)
+
+                dl_path = Path(dl_dir).expanduser()
+                hdf_files = list(dl_path.glob("*.hdf")) + list(dl_path.glob("*.HDF"))
+                if hdf_files:
+                    st.success(f"✅ {len(hdf_files)} archivos HDF en `{dl_path}`")
+                    with st.expander("Ver archivos descargados"):
+                        for f in sorted(hdf_files):
+                            st.text(f"📄 {f.name}  —  {f.stat().st_size/1024**2:.1f} MB")
+            except Exception as e:
+                st.error(f"**Error:** {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 2 — DESCUBRIR DATASETS
+# ══════════════════════════════════════════════════════════════════════════════
+with tabs[2]:
+    st.markdown('<div class="step-title">🗂️ Descubrir colecciones NASA CMR</div>', unsafe_allow_html=True)
+    st.caption("Llama a `discover_datasets`. Devuelve concept_id, short_name, versión, proveedor y título.")
+
+    disc_kw = st.text_input(
+        "🔑 Palabra clave", "aerosol",
+        placeholder="aerosol · sea surface temperature · NDVI · precipitation …",
+    )
+
+    if st.button("🗂️ Descubrir datasets", key="btn_discover", use_container_width=True):
+        with st.spinner("🔎 Consultando catálogo NASA CMR..."):
+            try:
+                from langchain_core.messages import HumanMessage
+                agent  = _build_earth_agent()
+                result = _run(agent.ainvoke({"messages": [
+                    HumanMessage(content=f"Encuentra datasets de NASA EarthData relacionados con {disc_kw}.")
+                ]}))
+                reply = result["messages"][-1].content
+                st.markdown(f'<div class="result-box">{reply}</div>', unsafe_allow_html=True)
+            except Exception as e:
+                st.error(f"**Error:** {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 3 — PIPELINE HDF
+# ══════════════════════════════════════════════════════════════════════════════
+with tabs[3]:
+    st.markdown('<div class="step-title">⚙️ Pipeline HDF → CSV → PostgreSQL → Gráficas</div>', unsafe_allow_html=True)
+    st.info(
+        "**Paso 1** HDF4 → CSV via `pyhdf`  ·  "
+        "**Paso 2** CSV → PostgreSQL  ·  "
+        "**Paso 3** Gráficas 2D (scatter map · heatmap · time series)"
+    )
+
+    pc1, pc2 = st.columns(2)
+    with pc1:
+        p_hdf   = st.text_input("📁 Dir. HDF",    value=hdf_dir,    key="p_hdf")
+        p_out   = st.text_input("📂 Dir. CSV",    value=output_dir, key="p_out")
+    with pc2:
+        p_plots = st.text_input("🖼️ Dir. plots",  value=plots_dir,  key="p_plots")
+        p_db    = st.text_input("🗄️ DB URL",      value=db_url,     type="password", key="p_db")
+
+    p_var = st.selectbox("Variable aerosol", [
+        "Optical_Depth_Land_And_Ocean",
+        "Image_Optical_Depth_Land_And_Ocean",
+        "Corrected_Optical_Depth_Land_wav2p1",
+        "Optical_Depth_Ratio_Small_Land",
+        "Angstrom_Exponent_1_Ocean",
+        "Angstrom_Exponent_2_Ocean",
+        "Mass_Concentration_Land",
+        "Aerosol_Cloud_Fraction_Land",
+        "Aerosol_Cloud_Fraction_Ocean",
+        "Fitting_Error_Land",
+    ], key="p_var")
+
+    # Flags skip — igual que run_pipeline()
+    sk1, sk2, sk3 = st.columns(3)
+    skip_convert = sk1.checkbox("⏭️ Saltar HDF→CSV")
+    skip_load    = sk2.checkbox("⏭️ Saltar carga BD")
+    skip_plot    = sk3.checkbox("⏭️ Saltar gráficas")
+
+    p_mode = st.radio(
+        "Modo de ejecución",
+        ["⚡ Directo — run_pipeline()", "🤖 Agentes — PipelineAgent (LangGraph + MCP)"],
+        horizontal=True,
+    )
+
+    if st.button("▶️ Ejecutar pipeline", key="btn_pipe", use_container_width=True):
+        for d in [p_hdf, p_out, p_plots]:
+            Path(d).expanduser().mkdir(parents=True, exist_ok=True)
+
+        # Logger que escribe en tiempo real en el widget
+        log_placeholder = st.empty()
+        log_lines: list[str] = []
+
+        class StreamlitHandler(logging.Handler):
+            def emit(self, record):
+                log_lines.append(self.format(record))
+                log_placeholder.markdown(
+                    '<div class="result-box">' + "<br>".join(log_lines[-30:]) + "</div>",
+                    unsafe_allow_html=True,
                 )
-                map_df = map_df[
-                    map_df['lat'].between(-90, 90) &
-                    map_df['lon'].between(-180, 180)
-                ]
-            else:
-                st.info("No hay columnas numéricas suficientes para el mapa.")
 
-        if map_df is not None:
-            render_map(map_df)
-            # Guardar map_df en session para usarlo en tab 3
-            st.session_state["map_df"] = map_df
+        pipe_logger = logging.getLogger("pipe_run")
+        pipe_logger.setLevel(logging.INFO)
+        sh = StreamlitHandler()
+        sh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%H:%M:%S"))
+        pipe_logger.addHandler(sh)
 
-# ── TAB 2: Historial ──
-with tab_historial:
-    st.subheader("Archivos guardados en la base de datos")
-    try:
-        archivos = load_archivos()
-        if archivos.empty:
-            st.info("No hay archivos guardados aún.")
-        else:
-            archivos['fecha_carga'] = pd.to_datetime(archivos['fecha_carga']).dt.strftime('%Y-%m-%d %H:%M')
-            st.dataframe(archivos, use_container_width=True, hide_index=True)
+        with st.spinner("⚙️ Ejecutando pipeline..."):
+            try:
+                if "Directo" in p_mode:
+                    from hdf_pipeline import run_pipeline
+                    results = run_pipeline(
+                        hdf_dir=p_hdf,
+                        output_dir=p_out,
+                        plots_dir=p_plots,
+                        db_url=p_db,
+                        variable=p_var,
+                        skip_convert=skip_convert,
+                        skip_load=skip_load,
+                        skip_plot=skip_plot,
+                        logger=pipe_logger,
+                    )
+                else:
+                    from pipeline_agent import PipelineAgent, run_pipeline_agents
+                    pa = PipelineAgent(model_name=llm_model)
+                    results = _run(run_pipeline_agents(
+                        hdf_dir=p_hdf,
+                        output_dir=p_out,
+                        plots_dir=p_plots,
+                        db_url=p_db,
+                        variable=p_var,
+                        agent=pa,
+                    ))
 
-            col1, col2 = st.columns(2)
-            with col1:
-                archivo_sel = st.selectbox(
-                    "Selecciona un archivo",
-                    archivos['id'].tolist(),
-                    format_func=lambda x: archivos.loc[archivos['id']==x, 'nombre'].values[0]
-                )
-            with col2:
-                if st.button("🗑️ Eliminar"):
-                    delete_archivo(archivo_sel)
-                    st.success("Archivo eliminado.")
-                    st.rerun()
+                csvs_n = len(results.get("csvs",  []))
+                rows_n = results.get("rows_loaded", 0)
+                plot_n = len(results.get("plots", []))
 
-            if st.button("🗺️ Ver en mapa"):
-                with st.spinner("Cargando puntos..."):
-                    puntos = load_puntos(archivo_sel)
-                st.subheader("🗺️ Mapa desde base de datos")
-                render_map(puntos)
+                st.markdown(f"""
+<div class="metric-row">
+  <div class="metric-pill"><div class="val">{csvs_n}</div><div class="lbl">CSVs generados</div></div>
+  <div class="metric-pill"><div class="val">{rows_n:,}</div><div class="lbl">Filas en BD</div></div>
+  <div class="metric-pill"><div class="val">{plot_n}</div><div class="lbl">Gráficas</div></div>
+</div>""", unsafe_allow_html=True)
 
-    except Exception as e:
-        st.error(f"Error al conectar con la base de datos: {e}")
+                if results.get("plots"):
+                    st.markdown("#### Gráficas generadas")
+                    cols = st.columns(min(3, len(results["plots"])))
+                    for i, p in enumerate(results["plots"]):
+                        cols[i % 3].image(str(p), caption=Path(p).name, use_container_width=True)
 
-# ── TAB 3: Subir a BD ──
-with tab_subir:
-    if "map_df" not in st.session_state:
-        st.info("Primero carga un archivo en la tab **📊 Datos cargados** para poder guardarlo.")
+                if results.get("messages") and "Agentes" in p_mode:
+                    with st.expander("📋 Mensajes de los agentes"):
+                        for m in results["messages"]:
+                            st.text(m.content if hasattr(m, "content") else str(m))
+
+                st.session_state["last_plots"] = results.get("plots", [])
+
+            except ImportError as e:
+                st.error(f"Módulo no encontrado: **{e}**")
+                st.info("Asegúrate de que `hdf_pipeline.py` y `pipeline_agent.py` estén en el directorio.")
+            except Exception as e:
+                st.error(f"**Error en pipeline:** {e}")
+            finally:
+                pipe_logger.removeHandler(sh)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 4 — GRÁFICAS
+# ══════════════════════════════════════════════════════════════════════════════
+with tabs[4]:
+    st.markdown('<div class="step-title">📊 Visualización de aerosoles</div>', unsafe_allow_html=True)
+
+    st.button("🔄 Actualizar desde disco", key="btn_refresh")
+
+    plots_path = Path(plots_dir).expanduser()
+    disk_pngs  = sorted(plots_path.glob("*.png")) if plots_path.exists() else []
+    last_plots = [Path(p) for p in st.session_state.get("last_plots", [])]
+    all_pngs   = list({str(p): p for p in disk_pngs + last_plots}.values())
+
+    if not all_pngs:
+        st.info(f"Sin gráficas en `{plots_path}`. Ejecuta el pipeline primero.")
     else:
-        map_df  = st.session_state["map_df"]
-        nombre  = st.session_state.get("nombre", "desconocido")
-        dataset = st.session_state.get("dataset", "")
-        formato = st.session_state.get("formato", "")
+        st.caption(f"{len(all_pngs)} imagen(es) en `{plots_path}`")
+        cols = st.columns(2)
+        for i, png in enumerate(sorted(all_pngs, key=lambda p: str(p))):
+            cols[i % 2].image(str(png), caption=Path(png).name, use_container_width=True)
 
-        st.subheader("💾 Guardar en base de datos")
-        st.write(f"**Archivo:** {nombre}")
-        st.write(f"**Dataset:** {dataset}")
-        st.write(f"**Formato:** {formato}")
-        st.write(f"**Puntos a guardar:** {len(map_df):,}")
+    st.divider()
+    st.markdown("#### Generar gráficas directamente desde PostgreSQL")
+    st.caption("Usa `AerosolPlotter` de `hdf_pipeline.py`")
 
-        if st.button("💾 Confirmar y guardar"):
-            with st.spinner("Guardando en la base de datos..."):
-                archivo_id = save_to_db(nombre, str(dataset), formato, map_df)
-            st.success(f"✅ Guardado correctamente (ID: {archivo_id}, {len(map_df):,} puntos)")
+    g1, g2 = st.columns(2)
+    with g1:
+        g_var  = st.selectbox("Variable", [
+            "Optical_Depth_Land_And_Ocean",
+            "Image_Optical_Depth_Land_And_Ocean",
+            "Corrected_Optical_Depth_Land_wav2p1",
+        ], key="g_var")
+        g_vmin = st.number_input("Vmin",  value=0.0,  key="g_vmin")
+        g_vmax = st.number_input("Vmax",  value=1.5,  key="g_vmax")
+    with g2:
+        g_res  = st.number_input("Resolución heatmap (°)", value=0.5, key="g_res")
+        g_db   = st.text_input("DB URL", value=db_url, type="password", key="g_db")
+
+    g_types = st.multiselect(
+        "Tipos de gráfica",
+        ["scatter_map", "heatmap", "time_series"],
+        default=["scatter_map", "heatmap", "time_series"],
+        key="g_types",
+    )
+
+    if st.button("📊 Generar desde BD", key="btn_gen", use_container_width=True):
+        with st.spinner("Generando gráficas..."):
+            try:
+                from hdf_pipeline import AerosolPlotter, PostgresLoader
+                loader  = PostgresLoader(db_url=g_db)
+                plotter = AerosolPlotter(loader=loader, plots_dir=plots_dir)
+                generated = []
+                if "scatter_map"  in g_types:
+                    p = plotter.scatter_map(variable=g_var, vmin=g_vmin, vmax=g_vmax)
+                    if p: generated.append(p)
+                if "heatmap"      in g_types:
+                    p = plotter.heatmap(variable=g_var, resolution=g_res, vmin=g_vmin, vmax=g_vmax)
+                    if p: generated.append(p)
+                if "time_series"  in g_types:
+                    p = plotter.time_series(variable=g_var)
+                    if p: generated.append(p)
+
+                if generated:
+                    cols = st.columns(min(3, len(generated)))
+                    for i, png in enumerate(generated):
+                        cols[i % 3].image(str(png), caption=png.name, use_container_width=True)
+                    st.session_state["last_plots"] = [str(p) for p in generated]
+                else:
+                    st.warning("No se generaron gráficas — BD vacía o sin datos para esa variable.")
+            except ImportError:
+                st.error("`hdf_pipeline.py` no encontrado.")
+            except Exception as e:
+                st.error(f"**Error:** {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 5 — BASE DE DATOS
+# ══════════════════════════════════════════════════════════════════════════════
+with tabs[5]:
+    st.markdown('<div class="step-title">🗄️ PostgreSQL — aerosol_data</div>', unsafe_allow_html=True)
+    st.caption("Usa `PostgresLoader.summary()` de `hdf_pipeline.py` y consultas directas.")
+
+    db_conn = st.text_input("DB URL", value=db_url, type="password", key="db_conn")
+
+    col_sum, col_sql = st.columns(2)
+
+    with col_sum:
+        st.markdown("**Resumen estadístico**")
+        if st.button("📋 Ver resumen", key="btn_summary", use_container_width=True):
+            with st.spinner("Consultando..."):
+                try:
+                    from hdf_pipeline import PostgresLoader
+                    loader = PostgresLoader(db_url=db_conn)
+                    df = loader.summary()
+                    if df.empty:
+                        st.info("La tabla `aerosol_data` está vacía.")
+                    else:
+                        st.dataframe(df, use_container_width=True)
+                        if "puntos" in df.columns:
+                            total_pts = int(df["puntos"].sum())
+                            st.markdown(
+                                f'<div class="metric-row">'
+                                f'<div class="metric-pill"><div class="val">{len(df)}</div>'
+                                f'<div class="lbl">Variables</div></div>'
+                                f'<div class="metric-pill"><div class="val">{total_pts:,}</div>'
+                                f'<div class="lbl">Total puntos</div></div>'
+                                f'</div>',
+                                unsafe_allow_html=True,
+                            )
+                except ImportError:
+                    st.error("`hdf_pipeline.py` no encontrado.")
+                except Exception as e:
+                    st.error(f"**Error:** {e}")
+
+    with col_sql:
+        st.markdown("**Consulta SQL personalizada**")
+        sql = st.text_area(
+            "SQL",
+            "SELECT variable, COUNT(*) AS n FROM aerosol_data GROUP BY variable ORDER BY n DESC;",
+            height=130,
+            key="sql",
+        )
+        if st.button("▶️ Ejecutar SQL", key="btn_sql", use_container_width=True):
+            with st.spinner("Ejecutando..."):
+                try:
+                    import pandas as pd
+                    import psycopg2
+                    conn = psycopg2.connect(db_conn)
+                    df   = pd.read_sql(sql, conn)
+                    conn.close()
+                    st.dataframe(df, use_container_width=True)
+                    st.caption(f"{len(df)} fila(s) devuelta(s)")
+                except Exception as e:
+                    st.error(f"**Error SQL:** {e}")
+
+
+# ─── Footer ───────────────────────────────────────────────────────────────────
+st.divider()
+st.markdown(
+    "<div style='text-align:center;color:#2a5a8a;font-size:.77rem;font-family:IBM Plex Mono,monospace;'>"
+    "NASA EarthData Explorer · MODIS MYD04_3K Aerosoles · LangGraph + MCP + Streamlit"
+    "</div>",
+    unsafe_allow_html=True,
+)
