@@ -1,0 +1,26 @@
+name: qnasagent
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - gdal=3.10.3
+  - hdf4
+  - libnetcdf
+  - pyhdf
+  - h5py
+  - pandas
+  - numpy
+  - matplotlib
+  - psycopg2
+  - pip
+  - pip:
+      - streamlit>=1.35.0
+      - langgraph>=0.2.0
+      - langchain>=0.3.0
+      - langchain-openai>=0.2.0
+      - earthaccess>=0.9.0
+      - python-dotenv
+      - tqdm
+      - mcp
+      - langchain_mcp_adapters
